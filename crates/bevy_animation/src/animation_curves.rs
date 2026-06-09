@@ -84,7 +84,7 @@
 //! [`animated_field`]: crate::animated_field
 
 use core::{
-    any::TypeId,
+    any::{Any, TypeId},
     fmt::{self, Debug, Formatter},
     marker::PhantomData,
 };
@@ -306,6 +306,18 @@ pub struct AnimatableCurveEvaluator<A: Animatable> {
     property: Box<dyn AnimatableProperty<Property = A>>,
 }
 
+impl<A: Animatable> AnimatableCurveEvaluator<A> {
+    pub(super) fn push_value(&mut self, value: A, weight: f32, graph_node: AnimationNodeIndex) {
+        self.evaluator
+            .stack
+            .push(BasicAnimationCurveEvaluatorStackElement {
+                value,
+                weight,
+                graph_node,
+            });
+    }
+}
+
 impl<P, C> AnimatableCurve<P, C>
 where
     P: AnimatableProperty,
@@ -389,6 +401,11 @@ where
             });
         Ok(())
     }
+
+    fn sample_clamped(&self, t: f32) -> Box<dyn Any> {
+        let value = self.curve.sample_clamped(t);
+        Box::new(value)
+    }
 }
 
 impl<A: Animatable> AnimationCurveEvaluator for AnimatableCurveEvaluator<A> {
@@ -408,8 +425,8 @@ impl<A: Animatable> AnimationCurveEvaluator for AnimatableCurveEvaluator<A> {
         self.evaluator.push_blend_register(weight, graph_node)
     }
 
-    fn commit(&mut self, mut entity: AnimationEntityMut) -> Result<(), AnimationEvaluationError> {
-        let property = self.property.get_mut(&mut entity)?;
+    fn commit(&mut self, entity: &mut AnimationEntityMut) -> Result<(), AnimationEvaluationError> {
+        let property = self.property.get_mut(entity)?;
         *property = self
             .evaluator
             .stack
@@ -600,11 +617,14 @@ pub trait AnimationCurve: Debug + Send + Sync + 'static {
         weight: f32,
         graph_node: AnimationNodeIndex,
     ) -> Result<(), AnimationEvaluationError>;
+
+    /// Samples the curve at the given time `t` and returns a Boxed value.
+    fn sample_clamped(&self, t: f32) -> Box<dyn Any>;
 }
 
 /// The [`EvaluatorId`] is used to look up the [`AnimationCurveEvaluator`] for an [`AnimatableProperty`].
 /// For a given animated property, this ID should always be the same to allow things like animation blending to occur.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum EvaluatorId<'a> {
     /// Corresponds to a specific field on a specific component type.
     /// The `TypeId` should correspond to the component type, and the `usize`
@@ -700,7 +720,7 @@ pub trait AnimationCurveEvaluator: Downcast + Send + Sync + 'static {
     ///
     /// The property on the component must be overwritten with the value from
     /// the stack, not blended with it.
-    fn commit(&mut self, entity: AnimationEntityMut) -> Result<(), AnimationEvaluationError>;
+    fn commit(&mut self, entity: &mut AnimationEntityMut) -> Result<(), AnimationEvaluationError>;
 }
 
 impl_downcast!(AnimationCurveEvaluator);
@@ -785,15 +805,19 @@ where
 #[macro_export]
 macro_rules! animated_field {
     ($component:ident::$field:tt) => {
-        AnimatedField::new_unchecked(stringify!($field), |component: &mut $component| {
-            &mut component.$field
-        })
+        $crate::animation_curves::AnimatedField::new_unchecked(
+            stringify!($field),
+            |component: &mut $component| &mut component.$field,
+        )
     };
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::VariableCurve;
+    use bevy_math::Vec3;
+    use bevy_transform::components::Transform;
 
     #[test]
     fn test_animated_field_tuple_struct_simple_uses() {
@@ -806,5 +830,29 @@ mod tests {
         let _ = AnimatedField::new_unchecked("0", |b: &mut B| &mut b.0);
         let _ = AnimatedField::new_unchecked("1", |b: &mut B| &mut b.1);
         let _ = AnimatedField::new_unchecked("2", |b: &mut B| &mut b.2);
+    }
+
+    #[test]
+    fn test_sample_animation_curve() {
+        let variable_curve = VariableCurve::new(AnimatableCurve::new(
+            animated_field!(Transform::translation),
+            AnimatableKeyframeCurve::new([
+                (0.0, Vec3::new(0., 0., 1.)),
+                (1.0, Vec3::new(1., 0., 0.)),
+            ])
+            .expect("Failed to create power level curve"),
+        ));
+        let value = variable_curve
+            .0
+            .sample_clamped(0.)
+            .downcast::<Vec3>()
+            .unwrap();
+        assert_eq!(*value, Vec3::new(0., 0., 1.));
+        let value = variable_curve
+            .0
+            .sample_clamped(1.)
+            .downcast::<Vec3>()
+            .unwrap();
+        assert_eq!(*value, Vec3::new(1., 0., 0.));
     }
 }
